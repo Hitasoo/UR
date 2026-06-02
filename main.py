@@ -12,7 +12,7 @@ import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Переменные окружения ---
+# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 YANDEX_LOGIN = os.getenv("YANDEX_LOGIN")
 YANDEX_APP_PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
 SENDER_TO_CHECK = os.getenv("SENDER_TO_CHECK")
@@ -20,17 +20,11 @@ SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME")
 
-# Проверка наличия переменных
 if not all([YANDEX_LOGIN, YANDEX_APP_PASSWORD, SENDER_TO_CHECK, SERVICE_ACCOUNT_JSON, SPREADSHEET_ID, WORKSHEET_NAME]):
     logging.error("Не все переменные окружения установлены")
     exit(1)
 
-# Загружаем JSON из строки
-try:
-    service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
-except json.JSONDecodeError as e:
-    logging.error(f"Ошибка парсинга SERVICE_ACCOUNT_JSON: {e}")
-    exit(1)
+service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
 
 def extract_rfq_from_filename(filename: str) -> str:
     base = filename.split('_')[0].split('.')[0]
@@ -41,14 +35,17 @@ def parse_quotation_excel(file_content: bytes, filename: str) -> list:
     try:
         wb = load_workbook(io.BytesIO(file_content), data_only=True)
         if "Quotation" not in wb.sheetnames:
-            logging.error(f"Лист 'Quotation' не найден: {wb.sheetnames}")
+            logging.error(f"Нет листа 'Quotation': {wb.sheetnames}")
             return []
         ws = wb["Quotation"]
 
         rfq_cell = ws["H2"].value
         rfq = str(rfq_cell).strip() if rfq_cell else extract_rfq_from_filename(filename)
         date_cell = ws["O2"].value
-        date_str = date_cell.strftime("%d.%m.%Y") if hasattr(date_cell, 'strftime') else str(date_cell) if date_cell else ""
+        if hasattr(date_cell, 'strftime'):
+            date_str = date_cell.strftime("%d.%m.%Y")
+        else:
+            date_str = str(date_cell) if date_cell else ""
 
         header_row = None
         for r in range(1, ws.max_row + 1):
@@ -66,9 +63,15 @@ def parse_quotation_excel(file_content: bytes, filename: str) -> list:
             if not first_val or str(first_val).strip() == "":
                 break
             qty = ws.cell(row, 6).value
-            qty_str = str(int(qty)) if isinstance(qty, (int, float)) and qty == int(qty) else str(qty) if qty else ""
+            if isinstance(qty, (int, float)):
+                qty_str = str(int(qty)) if qty == int(qty) else str(qty)
+            else:
+                qty_str = str(qty) if qty else ""
             target = ws.cell(row, 9).value
-            target_str = target.strftime("%d.%m.%Y") if hasattr(target, 'strftime') else str(target) if target else ""
+            if hasattr(target, 'strftime'):
+                target_str = target.strftime("%d.%m.%Y")
+            else:
+                target_str = str(target) if target else ""
 
             rows.append({
                 "RFQ": rfq,
@@ -86,11 +89,11 @@ def parse_quotation_excel(file_content: bytes, filename: str) -> list:
             row += 1
         return rows
     except Exception as e:
-        logging.error(f"Ошибка парсинга: {e}", exc_info=True)
+        logging.error(f"Ошибка парсинга Excel: {e}", exc_info=True)
         return []
 
 def main():
-    logging.info("Запуск скрипта")
+    logging.info("Запуск")
     try:
         with IMAPClient("imap.yandex.ru") as client:
             client.login(YANDEX_LOGIN, YANDEX_APP_PASSWORD)
@@ -100,6 +103,44 @@ def main():
             if not messages:
                 return
 
+            creds = Credentials.from_service_account_info(
+                service_account_info,
+                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+            )
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_key(SPREADSHEET_ID)
+            ws = sh.worksheet(WORKSHEET_NAME)
+
+            # Собираем существующие ключи (RFQ, №, PN) для проверки дубликатов
+            all_rows = ws.get_all_values()
+            existing_keys = set()
+            if len(all_rows) > 1:
+                for row in all_rows[1:]:
+                    if len(row) >= 4:
+                        rfq = row[0] if row[0] else ""
+                        num = row[2] if len(row) > 2 else ""
+                        pn = row[3] if len(row) > 3 else ""
+                        if rfq and num and pn:
+                            existing_keys.add((rfq, num, pn))
+
+            # Заголовки, если лист пустой
+            expected_headers = ["RFQ","Date","№","PN","DESC","Alt","R. Qty.","Unit","Req.Condition","Target Date","Comment"]
+            if not all_rows:
+                ws.append_row(expected_headers)
+                logging.info("Заголовки добавлены")
+
+            # Определяем соответствие колонок по первой строке
+            headers_row = ws.row_values(1)
+            col_index = {}
+            for idx, val in enumerate(headers_row, start=1):
+                if val in expected_headers:
+                    col_index[val] = idx
+            if "RFQ" not in col_index:
+                logging.error("Заголовок 'RFQ' не найден в первой строке")
+                return
+            max_col = max(col_index.values()) if col_index else len(expected_headers)
+
+            # Обрабатываем каждое письмо
             for msg_id in messages:
                 logging.info(f"Обработка письма {msg_id}")
                 email_data = client.fetch([msg_id], ['RFC822'])
@@ -120,46 +161,23 @@ def main():
                 if not data:
                     continue
 
-                creds = Credentials.from_service_account_info(
-                    service_account_info,
-                    scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-                )
-                gc = gspread.authorize(creds)
-                sh = gc.open_by_key(SPREADSHEET_ID)
-                ws = sh.worksheet(WORKSHEET_NAME)
-
-                expected_headers = ["RFQ","Date","№","PN","DESC","Alt","R. Qty.","Unit","Req.Condition","Target Date","Comment"]
-
-                # Если лист пустой – пишем заголовки и данные
-                if not ws.get_all_values():
-                    ws.append_row(expected_headers)
-                    for row_data in data:
-                        ws.append_row([row_data[h] for h in expected_headers])
-                    logging.info("Данные добавлены в пустой лист")
-                    continue
-
-                # Ищем колонки по заголовкам
-                headers_row = ws.row_values(1)
-                col_index = {}
-                for idx, val in enumerate(headers_row, start=1):
-                    if val in expected_headers:
-                        col_index[val] = idx
-
-                if "RFQ" not in col_index:
-                    logging.error("Заголовок 'RFQ' не найден в первой строке")
-                    continue
-
-                max_col = max(col_index.values()) if col_index else len(expected_headers)
+                new_count = 0
                 for row_data in data:
+                    key = (row_data["RFQ"], row_data["№"], row_data["PN"])
+                    if key in existing_keys:
+                        logging.info(f"Пропущен дубликат: {key}")
+                        continue
                     new_row = [""] * max_col
                     for header, value in row_data.items():
                         if header in col_index:
                             new_row[col_index[header] - 1] = value
                     ws.append_row(new_row)
-                logging.info(f"Добавлено {len(data)} строк")
+                    existing_keys.add(key)
+                    new_count += 1
+                logging.info(f"Добавлено {new_count} новых строк")
 
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}", exc_info=True)
+        logging.error(f"Ошибка: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
