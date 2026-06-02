@@ -3,7 +3,7 @@ name: RFQ Parser
 on:
   schedule:
     # Каждые 30 минут (настраивайте как хотите)
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
